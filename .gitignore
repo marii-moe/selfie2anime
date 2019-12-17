@@ -1,0 +1,4 @@
+*~
+*.pt
+anime/.ipynb_checkpoints/
+anime/wandb
