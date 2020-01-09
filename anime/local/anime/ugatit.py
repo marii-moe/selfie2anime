@@ -79,17 +79,26 @@ class UgatitModel(nn.Module):
         x_a,x_b=x[0] if len(x)==1 else x #hackery depending on pytorch trace flag, input can be different
         if self.training:
             if self.optimizing_gen:
-                return self.models['GA2B'](x_a),self.models['GB2A'](x_b)
+                fakeA2B,fakeB2A=self.models['GA2B'](x_a),self.models['GB2A'](x_b)
+                return (fakeA2B,fakeB2A,
+                    self.models['GB2A'](x_a),self.models['GA2B'](x_b),
+                    self.models['DA'](fakeB2A[0]),self.models['LA'](fakeB2A[0]),self.models['DB'](fakeA2B[0]),self.models['LB'](fakeA2B[0]),
+                    self.models['GB2A'](fakeA2B[0]),self.models['GA2B'](fakeB2A[0]))
             else:
-                return self.models['DA'](x_a),self.models['DB'](x_b),self.models['LA'](x_a),self.models['LB'](x_b)
+                fakeA2B,fakeB2A=self.models['GA2B'](x_a)[0],self.models['GB2A'](x_b)[0] #storing forward pass not needed?
+                return (self.models['DA'](x_a),self.models['LA'](x_a),self.models['DB'](x_b),self.models['LB'](x_b),
+                    self.models['DA'](fakeB2A),self.models['LA'](fakeB2A),self.models['DB'](fakeA2B),self.models['LB'](fakeA2B))
         else:
-            return self.models['GA2B'](x_a),self.models['GB2A'](x_b)
+            fakeA2B,fakeB2A=self.models['GA2B'](x_a),self.models['GB2A'](x_b)
+            return (fakeA2B,fakeB2A,
+                self.models['GB2A'](x_a),self.models['GA2B'](x_b),
+                self.models['DA'](fakeB2A[0]),self.models['LA'](fakeB2A[0]),self.models['DB'](fakeA2B[0]),self.models['LB'](fakeA2B[0]),
+                self.models['GB2A'](fakeA2B[0]),self.models['GA2B'](fakeB2A[0]))
 
 #Cell
 class UGATITLoss():
-    def __init__(self, models,cycle_weight = 10,identity_weight = 10,cam_weight = 1000,adv_weight=1):
+    def __init__(self,cycle_weight = 10,identity_weight = 10,cam_weight = 1000,adv_weight=1):
         store_attr(self, "cycle_weight,identity_weight,cam_weight,adv_weight")
-        self.model_GA2B,self.model_GB2A,self.model_DA,self.model_DB,self.model_LA,self.model_LB=models
         self.MSE_loss=nn.MSELoss()
         self.L1_loss=nn.L1Loss()
         self.BCE_loss=nn.BCEWithLogitsLoss()
@@ -99,12 +108,6 @@ class UGATITLoss():
     #xb should be pred, need to figure out what to do here
     def __call__(self,xb,yb):
         return self.generator_loss(xb,yb)
-
-    #fakeB - output of a generator that goes from A2B "B"
-    #realA - real image of type "A"
-    #genB2A - generator for going back to A(as in cycle)
-    def recon_loss(self,fakeB,realA,genB2A):
-        return self.L1_loss(genB2A(fakeB)[0],realA)
 
     def cam_loss(self,fake_A2B_cam_logit,fake_B2B_cam_logit):
         return self.BCE_loss(fake_A2B_cam_logit, torch.ones_like(fake_A2B_cam_logit)) \
@@ -116,28 +119,33 @@ class UGATITLoss():
         ad_cam_loss = self.MSE_loss(cam_prob, torch.full_like(cam_prob,fill_value=target_value))
         return  ad_loss + ad_cam_loss
     class GeneratorLoss(nn.Module):
-        def __init__(self,ugatit):
+        def __init__(self,ugatit_loss):
             super(UGATITLoss.GeneratorLoss, self).__init__()
-            self.ugatit=ugatit
-            self.losses=nn.ModuleList(self.ugatit.loss_funcs)
+            self.ugatit_loss=ugatit_loss
+            self.losses=nn.ModuleList(self.ugatit_loss.loss_funcs)
         def decodes(self,preds):
             return ((TensorImage(preds[0][0]),TensorImage(preds[1][0])),)
         def __call__(self,pred,yb):
             real_A,real_B=yb
-            u=self.ugatit
+            u=self.ugatit_loss
             fake_A2B, fake_A2B_cam_logit, _ = pred[0]
             fake_B2A, fake_B2A_cam_logit, _ = pred[1]
 
-            fake_A2A, fake_A2A_cam_logit, _ = u.model_GB2A(real_A)
-            fake_B2B, fake_B2B_cam_logit, _ = u.model_GA2B(real_B)
+            fake_A2A, fake_A2A_cam_logit, _ = pred[2]
+            fake_B2B, fake_B2B_cam_logit, _ = pred[3]
 
-            ad_loss_A = u.ad_loss(u.model_DA(fake_B2A)) + u.ad_loss(u.model_LA(fake_B2A))
-            ad_loss_B = u.ad_loss(u.model_DB(fake_A2B)) + u.ad_loss(u.model_LB(fake_A2B))
+            predDA_on_B2A,predLA_on_B2A,predDB_on_A2B,predLB_on_A2B=pred[4],pred[5],pred[6],pred[7]
+
+            fake_cycle_A,_,_ = pred[8]
+            fake_cycle_B,_,_= pred[9]
+
+            ad_loss_A = u.ad_loss(predDA_on_B2A) + u.ad_loss(predLA_on_B2A)
+            ad_loss_B = u.ad_loss(predDB_on_A2B) + u.ad_loss(predLB_on_A2B)
             loss = ad_loss_A + ad_loss_B
 
-            recon_loss_A = u.recon_loss(fake_A2B,real_A,u.model_GB2A)
-            recon_loss_B = u.recon_loss(fake_B2A,real_B,u.model_GA2B)
-            loss += u.cycle_weight * (recon_loss_A + recon_loss_B)
+            cycle_loss_A = u.L1_loss(fake_cycle_A,real_A)
+            cycle_loss_B = u.L1_loss(fake_cycle_B,real_B)
+            loss += u.cycle_weight * (cycle_loss_A + cycle_loss_B)
 
             identity_loss_A = u.L1_loss(fake_A2A, real_A)
             identity_loss_B = u.L1_loss(fake_B2B, real_B)
@@ -146,6 +154,7 @@ class UGATITLoss():
             cam_loss_A = u.cam_loss(fake_B2A_cam_logit,fake_A2A_cam_logit)
             cam_loss_B = u.cam_loss(fake_A2B_cam_logit,fake_B2B_cam_logit)
             return loss + u.cam_weight * (cam_loss_A + cam_loss_B)
+
     class DiscriminatorLoss(nn.Module):
         def __init__(self,ugatit):
             super(UGATITLoss.DiscriminatorLoss, self).__init__()
@@ -153,19 +162,16 @@ class UGATITLoss():
             self.mse=self.ugatit.MSE_loss
 
         def __call__(self,pred,yb):
-            real_A,real_B=yb
             u=self.ugatit
-            fake_A2B, _, _ = u.model_GA2B(real_A)
-            fake_B2A, _, _ = u.model_GB2A(real_B)
 
             #Need to replace with adversarial loss, three variable ones/zeros_like, img, discriminator
             loss = u.ad_loss(pred[0])
             loss += u.ad_loss(pred[1])
             loss += u.ad_loss(pred[2])
             loss += u.ad_loss(pred[3])
-            loss += u.ad_loss(u.model_DA(fake_B2A),target_value=0)
-            loss += u.ad_loss(u.model_LA(fake_B2A),target_value=0)
-            loss += u.ad_loss(u.model_DB(fake_A2B),target_value=0)
-            loss += u.ad_loss(u.model_LB(fake_A2B),target_value=0)
+            loss += u.ad_loss(pred[4],target_value=0)
+            loss += u.ad_loss(pred[5],target_value=0)
+            loss += u.ad_loss(pred[6],target_value=0)
+            loss += u.ad_loss(pred[7],target_value=0)
 
             return u.adv_weight * loss

@@ -23,4 +23,6 @@ from anime.ugatit import *
 from fast.callback.wandb import WandbCallback
 from anime.kid import *
 import wandb
+from fast.fp16_utils import convert_module
+from UGATIT import ILN,adaILN
 #from fast.callback.tensorboard import TensorBoardCallback
