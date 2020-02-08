@@ -12,7 +12,8 @@ class fakemodule(object):
     def method(a):
         return a
 sys.modules["cv2"] = fakemodule
-from UGATIT import ResnetGenerator,Discriminator,RhoClipper
+from anime.ugatit_networks import ResnetGenerator,Discriminator,RhoClipper
+#from UGATIT import ResnetGenerator,Discriminator,RhoClipper
 
 #Cell
 class UGATIT(object) :
@@ -85,7 +86,8 @@ class UgatitModel(nn.Module):
                     self.models['DA'](fakeB2A[0]),self.models['LA'](fakeB2A[0]),self.models['DB'](fakeA2B[0]),self.models['LB'](fakeA2B[0]),
                     self.models['GB2A'](fakeA2B[0]),self.models['GA2B'](fakeB2A[0]))
             else:
-                fakeA2B,fakeB2A=self.models['GA2B'](x_a)[0],self.models['GB2A'](x_b)[0] #storing forward pass not needed?
+                with torch.no_grad():
+                    fakeA2B,fakeB2A=self.models['GA2B'](x_a)[0],self.models['GB2A'](x_b)[0] #storing forward pass not needed?
                 return (self.models['DA'](x_a),self.models['LA'](x_a),self.models['DB'](x_b),self.models['LB'](x_b),
                     self.models['DA'](fakeB2A),self.models['LA'](fakeB2A),self.models['DB'](fakeA2B),self.models['LB'](fakeA2B))
         else:
