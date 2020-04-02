@@ -36,8 +36,8 @@ class ResnetBlock(nn.Module):
         self.conv_block = nn.Sequential(*conv_block)
 
     def forward(self, x):
-        out = x + self.conv_block(x)
-        return out
+        x = x + self.conv_block(x)
+        return x
 
 
 # Cell
@@ -46,7 +46,7 @@ class Spliter(nn.Module):
         super().__init__()
         self.splits=nn.ModuleList([layer(inp,out,bias=bias) for i in range(splits)])
     def forward(self,x):
-        return torch.cat(tuple([checkpoint(split,x) for split in self.splits]),1)
+        return torch.cat(tuple([checkpoint(split,x) if self.training else split(x) for split in self.splits]),1)
 
 # Cell
 class ResnetGenerator(nn.Module):
@@ -124,57 +124,65 @@ class ResnetGenerator(nn.Module):
                          nn.ReLU(True)]
 
         UpBlock2 += [ nn.ReflectionPad2d(3),
-                     nn.Conv2d(ngf, output_nc, kernel_size=7, stride=1, padding=0, bias=False),
-                     nn.Tanh()]
+                     nn.Conv2d(ngf, output_nc, kernel_size=7, stride=1, padding=0, bias=False)]
 
         self.DownBlock0 = nn.Sequential(*(DownBlock[:2]))
         self.DownBlock = nn.Sequential(*(DownBlock[2:]))
         self.FC0=FC0
         self.FC = nn.Sequential(*FC)
         self.UpBlock2 = nn.Sequential(*UpBlock2)
-        self.out_scale = torch.tensor(2., requires_grad=False)
-        self.out_shift = torch.tensor(1., requires_grad=False)
+        #self.out_scale = torch.tensor(2., requires_grad=False)
+        #self.out_shift = torch.tensor(1., requires_grad=False)
 
         self.big_IN=nn.InstanceNorm2d(ngf * mult)
-
-    def forward(self, input):
-        x = self.DownBlock0(input)
-        x = checkpoint_sequential(self.DownBlock, 2, x)
+    def _calculate_global_pooling(self, x):
         gap = torch.nn.functional.adaptive_avg_pool2d(x, 1)
-        gap_logit = self.gap_fc(gap.view(x.shape[0], -1))
-        gap_weight = list(self.gap_fc.parameters())[0]
-        gap_weight = gap_weight[1] - gap_weight[0]
-        gap = x * gap_weight[None].unsqueeze(2).unsqueeze(3)
+        cam_logit = self.gap_fc(gap.view(x.shape[0], -1)) if not self.training else checkpoint(self.gap_fc,gap.view(x.shape[0], -1))
+        gap = list(self.gap_fc.parameters())[0]
+        gap = gap[1] - gap[0]
+        gap = x * gap[None].unsqueeze(2).unsqueeze(3)
 
         gmp = torch.nn.functional.adaptive_max_pool2d(x, 1)
-        gmp_logit = self.gmp_fc(gmp.view(x.shape[0], -1))
-        gmp_weight = list(self.gmp_fc.parameters())[0]
-        gmp_weight = gmp_weight[1] - gmp_weight[0]
-        gmp = x * gmp_weight[None].unsqueeze(2).unsqueeze(3)
+        cam_logit = torch.cat([cam_logit,self.gmp_fc(gmp.view(x.shape[0], -1))], 1) if not self.training else torch.cat([cam_logit,checkpoint(self.gmp_fc,gmp.view(x.shape[0], -1))], 1)
+        gmp = list(self.gmp_fc.parameters())[0]
+        gmp = gmp[1] - gmp[0]
+        gmp = x * gmp[None].unsqueeze(2).unsqueeze(3)
 
-        cam_logit = torch.cat([gap_logit, gmp_logit], 1)
-        x = torch.cat([gap, gmp], 1)
-        x = self.relu(self.conv1x1(x))
+        return torch.cat([gap, gmp], 1), cam_logit
 
-        heatmap = torch.sum(x, dim=1, keepdim=True)
-        x = self.big_IN(x)
+    def _calculate_scale_shift(self,x):
         if self.light:
             x_ = torch.nn.functional.adaptive_avg_pool2d(x, 1)
             x_ = x_.view(x_.shape[0], -1)
-            x_ = checkpoint(self.FC0,x_)
+            x_ = checkpoint(self.FC0,x_) if (self.training) else self.FC0(x_)
             x_ = self.FC(x_)
         else:
             x_ = x.view(x.shape[0], -1)
             x_ = self.FC0(x_)
             x_ = self.FC(x_)
-        gamma, beta = self.gamma(x_), self.beta(x_)
+        return self.gamma(x_), self.beta(x_)
+
+    def forward(self, input):
+        x = self.DownBlock0(input)
+        for layer in self.DownBlock:
+            x=layer(x) if isinstance(layer,nn.ReLU) or not self.training else checkpoint(layer,x)
+        #x = checkpoint_sequential(self.DownBlock, 8, x) if (self.training) else self.DownBlock(x)
+        x,cam_logit = self._calculate_global_pooling(x)
+        x = self.relu(checkpoint(self.conv1x1,x) if self.training else self.conv1x1(x))
+
+        heatmap = torch.sum(x, dim=1, keepdim=True)
+        x = self.big_IN(x)
+
+        gamma, beta = self._calculate_scale_shift(x)
 
 
         for i in range(self.n_blocks):
-            x = getattr(self, 'UpBlock1_' + str(i+1))(x, gamma, beta) if i%4==0 else checkpoint(getattr(self, 'UpBlock1_' + str(i+1)),x, gamma, beta)
-        out = (self.UpBlock2(x)+self.out_shift)/self.out_scale
+            x = getattr(self, 'UpBlock1_' + str(i+1))(x, gamma, beta) if i%2==0 or not self.training else checkpoint(getattr(self, 'UpBlock1_' + str(i+1)),x, gamma, beta)
+        #x = self.UpBlock2(x) #(+self.out_shift)/self.out_scale
+        for layer in self.UpBlock2:
+            x = layer(x) if isinstance(layer,nn.ReLU) or not self.training else checkpoint(layer,x)
 
-        return out, cam_logit, heatmap
+        return x, cam_logit, heatmap
 
 
 # Cell
@@ -241,17 +249,21 @@ class ILN(nn.Module):
         self.beta.data.fill_(0.0)
         self.IN = nn.InstanceNorm2d(num_features,affine=False)
 
-    def forward(self, input):
+    def _iln(self,input):
         out = self.IN(input)
         out = self.rho_sigmoid(self.rho.expand(input.shape[0], -1, -1, -1)) * out
         out_ln = F.layer_norm(
             input, input.shape[1:], None,None, self.eps)
         out_ln = (1-self.rho_sigmoid(self.rho).expand(input.shape[0], -1, -1, -1)) * out_ln
-        out = out + out_ln
-        out = out * self.gamma.expand(input.shape[0], -1, -1, -1)
-        out = out + self.beta.expand(input.shape[0], -1, -1, -1)
+        return out + out_ln
 
-        return out.to(input.dtype)
+    def forward(self, x):
+        dtype=x.dtype
+        x = self._iln(x)
+        x = x * self.gamma.expand(x.shape[0], -1, -1, -1)
+        x = x + self.beta.expand(x.shape[0], -1, -1, -1)
+
+        return x.to(dtype)
 
 
 # Cell
@@ -290,15 +302,18 @@ class Discriminator(nn.Module):
         self.model = nn.Sequential(*model)
 
     def forward(self, input):
-        x = self.model(input)
+        x = self.model[0](input)
+        for layer in self.model[1:]:
+            x=layer(x) if isinstance(layer,nn.LeakyReLU) or self.training else checkpoint(layer,x)
+        #x = checkpoint_sequential(self.model[1:],10,x)
 
         gap = torch.nn.functional.adaptive_avg_pool2d(x, 1)
-        gap_logit = self.gap_fc(gap.view(x.shape[0], -1))
+        gap_logit = self.gap_fc(gap.view(x.shape[0], -1)) if not self.training else checkpoint(self.gap_fc,gap.view(x.shape[0], -1))
         gap_weight = list(self.gap_fc.parameters())[0]
         gap = x * gap_weight.unsqueeze(2).unsqueeze(3)
 
         gmp = torch.nn.functional.adaptive_max_pool2d(x, 1)
-        gmp_logit = self.gmp_fc(gmp.view(x.shape[0], -1))
+        gmp_logit = self.gmp_fc(gmp.view(x.shape[0], -1)) if not self.training else checkpoint(self.gmp_fc,gmp.view(x.shape[0], -1))
         gmp_weight = list(self.gmp_fc.parameters())[0]
         gmp = x * gmp_weight.unsqueeze(2).unsqueeze(3)
 

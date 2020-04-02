@@ -2,4 +2,8 @@
 *.pt
 anime/.ipynb_checkpoints/
 anime/wandb
+anime/nbs/wandb
+anime/nbs/models
 anime/models
+anime/nbs/.ipynb_checkpoints/
+__pycache__
