@@ -50,9 +50,10 @@ class Spliter(nn.Module):
 
 # Cell
 class ResnetGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, n_blocks=6, img_size=256, light=False):
+    def __init__(self, input_nc, output_nc, ngf=64, n_blocks=6, img_size=256, light=False, bce=True):
         assert(n_blocks >= 0)
         super(ResnetGenerator, self).__init__()
+        self.bce=bce
         self.input_nc = input_nc
         self.output_nc = output_nc
         self.ngf = ngf
@@ -81,8 +82,12 @@ class ResnetGenerator(nn.Module):
             DownBlock += [ResnetBlock(ngf * mult, use_bias=False)]
 
         # Class Activation Map
-        self.gap_fc = nn.Linear(ngf * mult, 2, bias=False)
-        self.gmp_fc = nn.Linear(ngf * mult, 2, bias=False)
+        if(self.bce):
+            self.gap_fc = nn.Linear(ngf * mult, 1, bias=False)
+            self.gmp_fc = nn.Linear(ngf * mult, 1, bias=False)
+        else:
+            self.gap_fc = nn.Linear(ngf * mult, 2, bias=False)
+            self.gmp_fc = nn.Linear(ngf * mult, 2, bias=False)
         self.conv1x1 = nn.Conv2d(ngf * mult * 2, ngf * mult, kernel_size=1, stride=1, bias=True)
         self.relu = nn.ReLU(True)
 
@@ -139,13 +144,13 @@ class ResnetGenerator(nn.Module):
         gap = torch.nn.functional.adaptive_avg_pool2d(x, 1)
         cam_logit = self.gap_fc(gap.view(x.shape[0], -1)) if not self.training else checkpoint(self.gap_fc,gap.view(x.shape[0], -1))
         gap = list(self.gap_fc.parameters())[0]
-        gap = gap[1] - gap[0]
+        gap = gap[0] if(self.bce) else gap[1]# - gap[0]
         gap = x * gap[None].unsqueeze(2).unsqueeze(3)
 
         gmp = torch.nn.functional.adaptive_max_pool2d(x, 1)
         cam_logit = torch.cat([cam_logit,self.gmp_fc(gmp.view(x.shape[0], -1))], 1) if not self.training else torch.cat([cam_logit,checkpoint(self.gmp_fc,gmp.view(x.shape[0], -1))], 1)
         gmp = list(self.gmp_fc.parameters())[0]
-        gmp = gmp[1] - gmp[0]
+        gmp = gmp[0] if(self.bce) else gmp[1]# - gmp[0]
         gmp = x * gmp[None].unsqueeze(2).unsqueeze(3)
 
         return torch.cat([gap, gmp], 1), cam_logit
